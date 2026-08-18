@@ -1,6 +1,6 @@
 # ai-agent
 
-Internal AI agent backend for [Jnana Farms](https://app.jnanafarms.com) — a FastAPI service that fronts a
+Internal AI agent backend for [Jnana Farms](https://jnanafarms.com) — a FastAPI service that fronts a
 [LangGraph](https://github.com/langchain-ai/langgraph) tool-calling agent so the internal team can ask
 questions and make entries against the farm's operational database (cultivation pipeline, inventory,
 attendance, WhatsApp orders, etc.) in natural language.
