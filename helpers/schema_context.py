@@ -126,3 +126,25 @@ notification_subscriptions(id, username→users.username, subscription[jsonb], t
 ── MISC ──
 app_updates(id, version, update, date)   # not tenant-scoped
 """
+
+ENTRY_CONTEXT = """\
+PRODUCTION ENTRIES (POST https://app.jnanafarms.com/api/{section})
+
+section="production" — legacy single/multi-entry format:
+  body = {"type": <type>, "entry": {...}}   (or "entries": [{...}, ...])
+  type ∈ spores | cultures | spawns | bulks | flushes
+  Required per entry (all types): batchId, strainId, status
+  flushes only: strainId is stored as `strain`, batchId as `bulk_batch_id` (server maps these)
+  Optional per-entry fields: uid, size, units, parent, parentType, date, transfer, note,
+    recipeNameId, f_series; tentId (spawns/bulks only); substrateRatio (bulks only);
+    wetWeight/dryWeight/yieldCycle (flushes only)
+
+section="tasks" — required: title. Optional: description, status, priority, dueDate,
+  assignedTo, relatedType, relatedId
+
+section="tents" — required: tent (name/PK). Optional: temperature, humidity, description,
+  status (or boolean Active), recTemp, recHumidity
+
+NOTE: `type` belongs in the JSON body (`body.type`), not a query string — the production
+route never reads a `?type=` query param.
+"""

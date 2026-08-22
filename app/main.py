@@ -9,9 +9,11 @@ import os
 from psycopg.rows import dict_row
 from dotenv import load_dotenv
 import logging
-from ..api.routes import router
+from api.routes import router
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
+from db.models import Base
+from db.engine import session_maker
 
 LOG_DIR = Path('logs')
 LOG_DIR.mkdir(exist_ok = True)
@@ -45,14 +47,15 @@ async def lifespan(app : FastAPI):
 
 app = FastAPI(lifespan = lifespan)
 
-FRONTEND_ORIGIN = os.getenv("FRONTEND_URL")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[os.getenv(FRONTEND_ORIGIN, "http://localhost:3000")],
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
 app.include_router(router)
+

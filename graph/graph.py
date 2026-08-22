@@ -1,5 +1,3 @@
-import json
-import langgraph 
 from langgraph.graph import StateGraph, START, END
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
@@ -11,13 +9,16 @@ from typing import TypedDict, Annotated, Sequence, Dict, List
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 from langchain_core.tools import tool
+from langgraph.graph.state import RunnableConfig
 from langgraph.prebuilt import ToolNode
 from dotenv import load_dotenv
-from sqlalchemy import sessionmaker, create_engine, text
+from sqlalchemy import text
+from db.engine import session_maker
 import os
 import requests
 import re 
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from helpers.retrieval import similarity_search
 from psycopg_pool import AsyncConnectionPool
 from fastapi import FastAPI, HTTPException, Request, Response
 from contextlib import asynccontextmanager
@@ -25,25 +26,12 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from helpers.query_checker import QueryCheck    
 import httpx
 
-
 load_dotenv()
-db_url = os.getenv("DB_URL")
-db = create_async_engine(db_url)
-session_maker = async_sessionmaker(bind = db, expire_on_commit = False)
-
-
-
 
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     sucess : bool
-
-agent = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0.0)
-agent_1 = ChatOpenAI(model = "deepseek-v4flash",
-                    openai_api_base="https://opencode.ai/zen/go/v1/chat/completions",
-                    openai_api_key=os.getenv("OPENCODE_API"))
-
 
 
 checker = QueryCheck(check_method = "LLM")
@@ -105,6 +93,18 @@ async def grep(pattern: str, path: str = ".", glob: str = "*", max_results: int 
         
     return document
 
+@tool
+async def retrieve_documents(query: str, top_k : int = 5) -> str: 
+    """ Search ingested documents for chunks relevant to the query"""
+    results = await similarity_search(query, top_k)
+    if not results:
+        return "No relevant documents found."
+
+    return "\n\n".join(
+        f"[{r['title']} — doc {r['document_id']}]\n{r['chunk_text']}"
+        for r in results
+    )
+
 
 @tool
 async def save(content: str) -> str:
@@ -113,18 +113,21 @@ async def save(content: str) -> str:
 
 
 @tool
-async def add_entries(type : str, section : str, entry : Dict[str, str]):
+async def add_entries(type : str, section : str, entry : Dict[str, str], config : RunnableConfig) -> str:
     """ Making input requests for making entries"""
     base_url = "https://app.jnanafarms.com"
     token = os.getenv("ENTERPRISE_TOKEN")
+    tenant_id = config['configurable'].get('tenant_id') 
 
-    #validating the data
-    data = entry
     async with httpx.AsyncClient() as client:
         response = await client.post(
-        f"{base_url}/api/{section}?type={type}",
-        json = data,
-        headers = {"Authorization": f"Bearer {token}"},
+        f"{base_url}/api/{section}",
+        json = {
+            "type" : type,
+            "entry" : entry
+        },
+        headers = {"Authorization": f"Bearer {token}",
+        'x-tenant' : tenant_id},
     )
     
 
@@ -145,7 +148,14 @@ async def should_continue(state: AgentState) -> AgentState:
     else:
         return "continue"
     
-tools = [db_query_tool, search, save, grep, add_entries]
+tools = [db_query_tool, search, save, grep, add_entries, retrieve_documents]
+
+
+# agent = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0.0).bind_tools(tools)
+agent = ChatOpenAI(model = "deepseek-v4-flash",
+                    openai_api_base=os.getenv("OPENCODE_API_BASE"),
+                    openai_api_key=os.getenv("OPENCODE_API")).bind_tools(tools)
+
 
 async def model_call(state : AgentState) -> AgentState:
     """ calling model for answers or tool calling"""
@@ -157,7 +167,7 @@ async def model_call(state : AgentState) -> AgentState:
 graph = StateGraph(AgentState)
 
 
-graph.add_node(model_call, "model")
+graph.add_node("model", model_call)
 graph.add_edge(START, "model")
 tool_node = ToolNode(tools = tools)
 graph.add_node("tools", tool_node)

@@ -1,17 +1,27 @@
 from fastapi import HTTPException, Request, Response, Depends, APIRouter, UploadFile, File
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.status import HTTP_200_OK, HTTP_500_INTERNAL_SERVER_ERROR
+
+from ingestion.ingestion import Ingestion
 from .deps import verify_jwt_token
-from ..db.models import ChatRequest, MessageResponse, OpenChat
+from db.models import ChatRequest, MessageResponse, OpenChat
 from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
 import json
 import os
-
+from sqlalchemy import select, update
+from db.engine import session_maker
+from db.models import DocumentEmbedding, Document
+from pathlib import Path
+import asyncio
+from sqlalchemy import text
 
 router = APIRouter()
-_openai_client = None
 
+UPLOAD_DIR = Path("pdfs")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+engine = os.getenv("INGESTION_ENGINE")
+process = os.getenv("INGESTION_PROCESS")
 
 def get_openai_client() -> AsyncOpenAI:
     # Lazy so the module (and the whole app) can still import when
@@ -26,7 +36,7 @@ async def chat_request( body : ChatRequest, request : Request, token_data: dict 
     try: 
         text = body.message
         thread_id = f"{token_data['sub']}:{body.session_id}"
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {"configurable": {"thread_id": thread_id, "tenant_id" : token_data.get("tenantId")}}
 
         async def event_generator():
             async for event in request.app.state.graph.astream_events(
@@ -46,7 +56,7 @@ async def chat_request( body : ChatRequest, request : Request, token_data: dict 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/api/open-chat")
+@router.post("/api/open-chat", )
 async def open_chat(body: OpenChat, request: Request, token_data: dict = Depends(verify_jwt_token)):
     thread_id = f"{token_data['sub']}:{body.session_id}"
     config = {"configurable": {"thread_id": thread_id}}
@@ -90,10 +100,76 @@ async def transcribe_audio(
 
 
 
+@router.post("/upload")
+async def upload_document(
+    file : UploadFile = File(...),
+    token_data : dict = Depends(verify_jwt_token),
+    upload_data : dict = {}
+):
+    """ 
+    Enables the user to upload files for ingestion and embedding to be used by the retriever and response model 
+    """
+    try: 
+        if file.content_type != "application/pdf": 
+            return {"error" : "only pdfs supported for now"}
+        
+        # declaring ingestion object
+        ingester = Ingestion(engine, process)
+        
 
+        file_path = UPLOAD_DIR / file.filename
+        with file_path.open('wb') as buffer:
+            while chunk := await file.read(1024*1024): 
+                buffer.write(chunk)
 
+        # ingest, get text, chunks, embeddings and store them
+        text, count = await ingester.ingest(file_path)
+        chunks = await ingester.chunking(text)
+        embeddings = await ingester.get_embeddings(chunks)
+        doc_id = await ingester.store_document(
+            source = str(file_path), title = file.filename, 
+            text = text, page_count = count,
+            chunks = chunks, embeddings = embeddings
+        )
+        
+        await file.close()
 
-
+        return {"document_id" : doc_id, "chunks" : len(chunks), "page_count" : count}, 200
 
     
+    except Exception as e: 
+        raise HTTPException(status_code=500, detail = str(e))
+
+
+@router.get("/api/get-sessions")
+async def get_sessions(request : Request, token_data : dict = Depends(verify_jwt_token)):
+    prefix = f"{token_data['sub']}:"
+    async with session_maker() as session: 
+        sesh =  await session.execute(
+            text("""
+                SELECT thread_id, MAX(checkpoint_id) AS latest
+                FROM checkpoints
+                WHERE thread_id LIKE :prefix
+                GROUP BY thread_id
+                ORDER BY latest DESC
+            """),
+            {"prefix": f"{prefix}%"},
+        )
+        rows = sesh.fetchall()
+
+    async def preview_for(thread_id : str) -> str: 
+        config  = { "configurable" : {'thread_id' : thread_id}}
+        state = await request.app.state.graph.aget_state(config)
+        messages = state.values.get("messages", []) if state.values else []
+        if not messages:
+            return ""
+        return messages[0].content[:80]
+
+    previews = await asyncio.gather(*(preview_for(thread_id) for thread_id, _ in rows))
+
+    seshes = [
+        {"session_id": thread_id[len(prefix):], "preview" : preview }
+                for (thread_id, _latest), preview in zip(rows, previews)
+            ]
+    return {"sessions": seshes}
 

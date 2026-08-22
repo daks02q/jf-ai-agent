@@ -5,8 +5,8 @@ import logging
 from .schema_context import SCHEMA_CONTEXT
 import os 
 from dotenv import load_dotenv
-from ..graph.graph import session_maker
-from ..db.models import QueryChecks
+from graph.graph import session_maker
+from db.models import QueryChecks
 from sqlalchemy import select, update
 
 load_dotenv()
@@ -47,7 +47,7 @@ class QueryCheck():
                 )
                 
                 logger.info("LLM response was: %s", response.choices[0])
-                async with session_maker as s: 
+                async with session_maker() as s: 
                     data = { "query" : query, "answer" : 'true' in response.choices[0].message.content.strip().lower()}
                     input_query = db.model()
                 print(response.choices[0])
