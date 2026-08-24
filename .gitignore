@@ -13,3 +13,4 @@ wheels/
 .claude
 alembic
 alembic.ini
+logs/
