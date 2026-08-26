@@ -11,6 +11,4 @@ wheels/
 .python-version
 .env 
 .claude
-alembic
-alembic.ini
 logs/
