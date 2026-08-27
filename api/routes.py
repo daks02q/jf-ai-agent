@@ -5,9 +5,7 @@ from starlette.status import HTTP_200_OK, HTTP_500_INTERNAL_SERVER_ERROR
 from ingestion.ingestion import Ingestion
 from .deps import verify_jwt_token
 from db.models import ChatRequest, MessageResponse, OpenChat
-from fastapi.responses import StreamingResponse
 from openai import AsyncOpenAI
-import json
 import os
 from sqlalchemy import select, update
 from db.engine import session_maker
@@ -32,26 +30,17 @@ def get_openai_client() -> AsyncOpenAI:
     return _openai_client
 
 @router.post('/api/chat/')
-async def chat_request( body : ChatRequest, request : Request, token_data: dict = Depends(verify_jwt_token)): 
-    try: 
-        text = body.message
+async def chat_request( body : ChatRequest, request : Request, token_data: dict = Depends(verify_jwt_token)):
+    try:
         thread_id = f"{token_data['sub']}:{body.session_id}"
         config = {"configurable": {"thread_id": thread_id, "tenant_id" : token_data.get("tenantId")}}
 
-        async def event_generator():
-            async for event in request.app.state.graph.astream_events(
-                {"messages": [("user", text)]},
-                config=config,
-                version='v2'
-            ):
-                if event['event'] == 'on_chat_model_stream':
-                    chunk = event['data']['chunk']
-                    if chunk.content:
-                        yield f"data: {json.dumps({'token': chunk.content})}\n\n"
-                elif event["event"] == "on_chain_end" and event['name'] == "LangGraph":
-                    yield f"data: {json.dumps({'done': True})}\n\n"
+        result = await request.app.state.graph.ainvoke(
+            {"messages": [("user", body.message)]},
 
-        return StreamingResponse(event_generator(), media_type = "text/event-stream")
+            config=config,
+        )
+        return {"message": result["messages"][-1].content}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -70,6 +59,7 @@ async def open_chat(body: OpenChat, request: Request, token_data: dict = Depends
     messages = [
         {"role": m.type, "content": m.content}
         for m in state.values.get("messages", [])
+        if m.type == 'human' or (m.type == 'ai'and not getattr(m, "tool_calls", None) and m.content) 
     ]
     return {"session_id": body.session_id, "messages": messages}
 

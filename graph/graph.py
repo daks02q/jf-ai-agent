@@ -13,7 +13,7 @@ from langgraph.graph.state import RunnableConfig
 from langgraph.prebuilt import ToolNode
 from dotenv import load_dotenv
 from sqlalchemy import text
-from db.engine import session_maker
+from db.engine import session_maker, myconext_session_maker
 import os
 import requests
 import re 
@@ -23,10 +23,39 @@ from psycopg_pool import AsyncConnectionPool
 from fastapi import FastAPI, HTTPException, Request, Response
 from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from helpers.query_checker import QueryCheck    
+from helpers.query_checker import QueryCheck
 import httpx
+import sqlglot
+from sqlglot import exp
+from sqlglot.optimizer.scope import traverse_scope
 
 load_dotenv()
+
+SYSTEM_CATALOG_SCHEMAS = {"information_schema", "pg_catalog"}
+
+
+def _scope_query_to_tenant(query: str, tenant_id: str) -> str:
+    """ Parses `query`, then injects an alias-qualified `tenant = '<tenant_id>'`
+    filter into every base-table scope in the query (top-level, each CTE, each
+    subquery, each side of a UNION/etc.) so tenant scoping doesn't depend on
+    the LLM remembering to write it correctly. CTE/derived-table references
+    are skipped — they're already scoped via their own defining SELECT.
+    """
+    tree = sqlglot.parse_one(query, dialect="postgres")
+
+    if not isinstance(tree, (exp.Select, exp.Union, exp.Except, exp.Intersect)):
+        raise ValueError("Only SELECT statements are allowed.")
+
+    for scope in traverse_scope(tree):
+        for alias, source in scope.sources.items():
+            if not isinstance(source, exp.Table):
+                continue  # CTE/derived-table reference, not a base table
+            if (source.db or "").lower() in SYSTEM_CATALOG_SCHEMAS:
+                continue  # information_schema / pg_catalog — no tenant column
+            condition = exp.condition(f"\"{alias}\".tenant = '{tenant_id}'")
+            scope.expression.where(condition, copy=False)
+
+    return tree.sql(dialect="postgres")
 
 
 class AgentState(TypedDict):
@@ -36,19 +65,40 @@ class AgentState(TypedDict):
 
 checker = QueryCheck(check_method = "LLM")
 @tool
-async def db_query_tool(query: str) -> str: 
-    """ query the database for the query by the LLM"""
-    if not checker.check(query):
+async def db_query_tool(query: str, config: RunnableConfig) -> str:
+    """ Run a read query against the farm operations database (PostgreSQL,
+    NOT SQLite — do not use sqlite_master or other SQLite-only syntax).
+
+    Key tables: strains, recipes, spores, cultures, spawns, bulks, flushes,
+    products, store, tents, vendors, tasks, activity_logs, task_logs,
+    tent_logs, inventory, orders, expenses, fuel_logs, pay_funds,
+    sale_products, harvest_stock_logs, customsers, users, attendance,
+    leave_requests. Tenant scoping is applied automatically to every table
+    referenced (including in joins, subqueries, CTEs, and UNIONs) — don't add
+    a tenant filter yourself. To see exact column names for a table, query
+    information_schema.columns (e.g. SELECT column_name FROM
+    information_schema.columns WHERE table_name = 'spores').
+    Always account for units when querying a table that a weight column.
+    """
+    tenant_id = config['configurable'].get('tenant_id')
+    if not tenant_id:
+        return "Query rejected: no tenant_id available for this session."
+    try:
+        scoped_query = _scope_query_to_tenant(query, tenant_id)
+    except ValueError as e:
+        return f"Query rejected: {e}"
+    except sqlglot.errors.ParseError as e:
+        return f"Query rejected: could not parse SQL ({e})."
+    if not await checker.check(scoped_query):
         return "Query rejected: contains a disallowed/unsafe SQL operation."
-    async with session_maker() as session:
-        result = await session.execute(text(query))
+    async with myconext_session_maker() as session:
+        result = await session.execute(text(scoped_query))
         return str(result.fetchall())
 
 
 @tool 
 async def grep(pattern: str, path: str = ".", glob: str = "*", max_results: int = 100) -> str:
     """ Search files under `path` for lines matching the regex pattern
-
     Args:
         pattern: Regular expression to search for.
         path: Directory (searched recursively) or single file to search.
@@ -159,7 +209,10 @@ agent = ChatOpenAI(model = "deepseek-v4-flash",
 
 async def model_call(state : AgentState) -> AgentState:
     """ calling model for answers or tool calling"""
-    system_prompt = SystemMessage(content="You are a helpful assistant that can answer questions and help with tasks for the internal team.")
+    system_prompt = SystemMessage(content=
+    """You are a helpful assistant that can answer questions and help with tasks for the internal team. 
+    Your first priority is to answer in a very clean manner. If you're querying tabular data then the user would like to see in bullet points rather than making at table with ASCII."""
+    )
     response = await agent.ainvoke([system_prompt] + state["messages"])
     return {"messages" : [response]}
 
