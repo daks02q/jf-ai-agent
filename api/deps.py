@@ -6,7 +6,7 @@ import jwt
 import json
 from datetime import datetime, timezone
 
-logger = logging.getLogger("logger")
+logger = logging.getLogger(__name__)
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")

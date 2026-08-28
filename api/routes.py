@@ -7,12 +7,16 @@ from .deps import verify_jwt_token
 from db.models import ChatRequest, MessageResponse, OpenChat
 from openai import AsyncOpenAI
 import os
+import time
+import logging
 from sqlalchemy import select, update
 from db.engine import session_maker
 from db.models import DocumentEmbedding, Document
 from pathlib import Path
 import asyncio
 from sqlalchemy import text
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -31,36 +35,46 @@ def get_openai_client() -> AsyncOpenAI:
 
 @router.post('/api/chat/')
 async def chat_request( body : ChatRequest, request : Request, token_data: dict = Depends(verify_jwt_token)):
+    thread_id = f"{token_data['sub']}:{body.session_id}"
+    logger.info("chat_request start thread_id=%s message_len=%d", thread_id, len(body.message))
+    start = time.monotonic()
     try:
-        thread_id = f"{token_data['sub']}:{body.session_id}"
         config = {"configurable": {"thread_id": thread_id, "tenant_id" : token_data.get("tenantId")}}
 
         result = await request.app.state.graph.ainvoke(
             {"messages": [("user", body.message)]},
-
             config=config,
         )
-        return {"message": result["messages"][-1].content}
+        reply = result["messages"][-1].content
+        logger.info(
+            "chat_request done thread_id=%s in %.2fs reply_len=%d",
+            thread_id, time.monotonic() - start, len(reply or ""),
+        )
+        return {"message": reply}
 
     except Exception as e:
+        logger.exception("chat_request failed thread_id=%s", thread_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/api/open-chat", )
 async def open_chat(body: OpenChat, request: Request, token_data: dict = Depends(verify_jwt_token)):
     thread_id = f"{token_data['sub']}:{body.session_id}"
+    logger.info("open_chat thread_id=%s", thread_id)
     config = {"configurable": {"thread_id": thread_id}}
 
     state = await request.app.state.graph.aget_state(config)
 
     if not state.values:
         # brand new session — nothing checkpointed yet
+        logger.info("open_chat thread_id=%s has no checkpoint yet", thread_id)
         return {"session_id": body.session_id, "messages": []}
 
     messages = [
         {"role": m.type, "content": m.content}
         for m in state.values.get("messages", [])
-        if m.type == 'human' or (m.type == 'ai'and not getattr(m, "tool_calls", None) and m.content) 
+        if m.type == 'human' or (m.type == 'ai'and not getattr(m, "tool_calls", None) and m.content)
     ]
+    logger.info("open_chat thread_id=%s returning %d messages", thread_id, len(messages))
     return {"session_id": body.session_id, "messages": messages}
 
 
@@ -76,6 +90,8 @@ async def transcribe_audio(
     IDs and strain names are easy for a transcriber to mangle, so this is
     a draft, not an auto-submit.
     """
+    logger.info("transcribe_audio start filename=%s content_type=%s", audio.filename, audio.content_type)
+    start = time.monotonic()
     try:
         contents = await audio.read()
         transcript = await get_openai_client().audio.transcriptions.create(
@@ -84,8 +100,13 @@ async def transcribe_audio(
             # Nudge the transcriber toward domain vocabulary it wouldn't otherwise guess.
             prompt="spores, cultures, spawns, bulks, flushes, batch, strain, tent, inventory",
         )
+        logger.info(
+            "transcribe_audio done in %.2fs transcript_len=%d",
+            time.monotonic() - start, len(transcript.text or ""),
+        )
         return {"text": transcript.text}
     except Exception as e:
+        logger.exception("transcribe_audio failed filename=%s", audio.filename)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -99,42 +120,53 @@ async def upload_document(
     """ 
     Enables the user to upload files for ingestion and embedding to be used by the retriever and response model 
     """
-    try: 
-        if file.content_type != "application/pdf": 
+    logger.info("upload_document start filename=%s content_type=%s", file.filename, file.content_type)
+    start = time.monotonic()
+    try:
+        if file.content_type != "application/pdf":
+            logger.warning("upload_document rejected non-pdf filename=%s type=%s", file.filename, file.content_type)
             return {"error" : "only pdfs supported for now"}
-        
+
         # declaring ingestion object
         ingester = Ingestion(engine, process)
-        
+
 
         file_path = UPLOAD_DIR / file.filename
         with file_path.open('wb') as buffer:
-            while chunk := await file.read(1024*1024): 
+            while chunk := await file.read(1024*1024):
                 buffer.write(chunk)
 
         # ingest, get text, chunks, embeddings and store them
         text, count = await ingester.ingest(file_path)
+        logger.info("upload_document ingested filename=%s pages=%d", file.filename, count)
         chunks = await ingester.chunking(text)
+        logger.info("upload_document chunked filename=%s chunks=%d", file.filename, len(chunks))
         embeddings = await ingester.get_embeddings(chunks)
         doc_id = await ingester.store_document(
-            source = str(file_path), title = file.filename, 
+            source = str(file_path), title = file.filename,
             text = text, page_count = count,
             chunks = chunks, embeddings = embeddings
         )
-        
+
         await file.close()
 
+        logger.info(
+            "upload_document done filename=%s doc_id=%s chunks=%d in %.2fs",
+            file.filename, doc_id, len(chunks), time.monotonic() - start,
+        )
         return {"document_id" : doc_id, "chunks" : len(chunks), "page_count" : count}, 200
 
-    
-    except Exception as e: 
+
+    except Exception as e:
+        logger.exception("upload_document failed filename=%s", file.filename)
         raise HTTPException(status_code=500, detail = str(e))
 
 
 @router.get("/api/get-sessions")
 async def get_sessions(request : Request, token_data : dict = Depends(verify_jwt_token)):
     prefix = f"{token_data['sub']}:"
-    async with session_maker() as session: 
+    logger.info("get_sessions user=%s", token_data['sub'])
+    async with session_maker() as session:
         sesh =  await session.execute(
             text("""
                 SELECT thread_id, MAX(checkpoint_id) AS latest
@@ -156,6 +188,7 @@ async def get_sessions(request : Request, token_data : dict = Depends(verify_jwt
         return messages[0].content[:80]
 
     previews = await asyncio.gather(*(preview_for(thread_id) for thread_id, _ in rows))
+    logger.info("get_sessions user=%s found %d sessions", token_data['sub'], len(rows))
 
     seshes = [
         {"session_id": thread_id[len(prefix):], "preview" : preview }

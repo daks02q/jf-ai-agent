@@ -28,8 +28,12 @@ import httpx
 import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
+import logging
+import time
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_CATALOG_SCHEMAS = {"information_schema", "pg_catalog"}
 
@@ -81,19 +85,35 @@ async def db_query_tool(query: str, config: RunnableConfig) -> str:
     Always account for units when querying a table that a weight column.
     """
     tenant_id = config['configurable'].get('tenant_id')
+    logger.info("db_query_tool called tenant=%s query=%r", tenant_id, query)
+
     if not tenant_id:
+        logger.warning("db_query_tool rejected: no tenant_id in session config")
         return "Query rejected: no tenant_id available for this session."
     try:
         scoped_query = _scope_query_to_tenant(query, tenant_id)
     except ValueError as e:
+        logger.warning("db_query_tool rejected (rewrite failed): %s", e)
         return f"Query rejected: {e}"
     except sqlglot.errors.ParseError as e:
+        logger.warning("db_query_tool rejected (parse error): %s", e)
         return f"Query rejected: could not parse SQL ({e})."
+
+    logger.info("db_query_tool scoped query: %s", scoped_query)
+
     if not await checker.check(scoped_query):
+        logger.warning("db_query_tool rejected by QueryCheck: %s", scoped_query)
         return "Query rejected: contains a disallowed/unsafe SQL operation."
+
+    start = time.monotonic()
     async with myconext_session_maker() as session:
         result = await session.execute(text(scoped_query))
-        return str(result.fetchall())
+        rows = result.fetchall()
+        logger.info(
+            "db_query_tool executed tenant=%s rows=%d in %.2fs",
+            tenant_id, len(rows), time.monotonic() - start,
+        )
+        return str(rows)
 
 
 @tool 
@@ -190,12 +210,15 @@ async def search(keyword: str, url: str, topic: str) -> str:
     return "Search is not available yet."
 
 async def should_continue(state: AgentState) -> AgentState:
-    """This helps determine if the model should continue going or no""" 
+    """This helps determine if the model should continue going or no"""
     messages = state['messages']
     last_message = messages[-1]
     if not last_message.tool_calls:
+        logger.info("Graph loop ending — final answer produced")
         return "end"
     else:
+        tool_names = [tc["name"] for tc in last_message.tool_calls]
+        logger.info("Graph loop continuing — tools requested: %s", tool_names)
         return "continue"
     
 tools = [db_query_tool, search, save, grep, add_entries, retrieve_documents]
@@ -210,10 +233,23 @@ agent = ChatOpenAI(model = "deepseek-v4-flash",
 async def model_call(state : AgentState) -> AgentState:
     """ calling model for answers or tool calling"""
     system_prompt = SystemMessage(content=
-    """You are a helpful assistant that can answer questions and help with tasks for the internal team. 
+    """You are a helpful assistant that can answer questions and help with tasks for the internal team.
     Your first priority is to answer in a very clean manner. If you're querying tabular data then the user would like to see in bullet points rather than making at table with ASCII."""
     )
+    logger.info("model_call invoked with %d messages in context", len(state["messages"]))
+    start = time.monotonic()
     response = await agent.ainvoke([system_prompt] + state["messages"])
+    elapsed = time.monotonic() - start
+    if response.tool_calls:
+        logger.info(
+            "model_call finished in %.2fs — requesting tools: %s",
+            elapsed, [tc["name"] for tc in response.tool_calls],
+        )
+    else:
+        logger.info(
+            "model_call finished in %.2fs — final answer (%d chars)",
+            elapsed, len(response.content or ""),
+        )
     return {"messages" : [response]}
 
 
