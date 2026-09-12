@@ -1,13 +1,12 @@
 from db.engine import session_maker
-from db.models import Document, DocumentEmbedding
+from db.models import DocumentEmbedding
 from sqlalchemy.orm import selectinload
 from sqlalchemy import select
-import re
-from sentence_transformers import SentenceTransformer
-from ingestion.ingestion import embedding_model
+from helpers.embeddings import embed_query
+
 
 async def similarity_search(query : str, top_k : int = 5) -> list[dict]: 
-    query_embedding = embedding_model.encode(query).tolist()
+    query_embedding = await embed_query(query)
     async with session_maker() as session: 
         stmt = (
             select(DocumentEmbedding)
