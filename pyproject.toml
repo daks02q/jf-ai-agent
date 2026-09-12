@@ -3,7 +3,7 @@ name = "ai-agent"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.10,<3.14"
 dependencies = [
     "alembic>=1.19.1",
     "asyncpg>=0.31.0",
@@ -33,4 +33,7 @@ dependencies = [
     "python-multipart>=0.0.32",
     "pyjwt>=2.13.0",
     "sqlglot>=30.17.0",
+    "paddlepaddle>=3.3.1",
+    "pandas>=2.3.3",
+    "google>=3.0.0",
 ]

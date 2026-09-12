@@ -46,7 +46,10 @@ class DocumentEmbedding(Base):
     document_id = Column(Integer, ForeignKey("documents.id"), nullable=False)
     chunk_index = Column(Integer)
     chunk_text = Column(Text)
-    embedding = Column(Vector(1024))            # dim must match your embedding model
+    embedding = Column(Vector(2048))            # dim must match your embedding model, 1024 -> 2048
+
+
+    
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     document = relationship("Document", back_populates="embeddings")

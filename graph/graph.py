@@ -1,6 +1,7 @@
 from langgraph.graph import StateGraph, START, END
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
+from openai import AsyncOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage, AIMessage
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
@@ -29,6 +30,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.optimizer.scope import traverse_scope
 import logging
+
 import time
 
 load_dotenv()
@@ -36,6 +38,35 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 SYSTEM_CATALOG_SCHEMAS = {"information_schema", "pg_catalog"}
+
+def sanitise_tool_calls_and_previous_messages(messages): 
+    """ Drop or repair left over tool calls and previous messages that can be picked up in the later conversation"""
+    cleaned, i, n = [], 0, len(messages)
+    while i < n: 
+        msg = messages[i]
+        cleaned.append(msg)
+        tool_calls = getattr(msg, "tool_calls", None)
+        if isinstance(msg, AIMessage) and tool_calls:
+            expected = {tc['id'] for tc in tool_calls if tc.get("id")}
+            if len(expected) != len(tool_calls): 
+                cleaned.pop()
+                i +=1
+                continue 
+            seen, j = set(), i + 1
+            while j < n and isinstance(messages[j], ToolMessage):
+                seen.add(messages[j].tool_call_id)
+                cleaned.append(messages[j])
+                j = j+1
+
+            for tid in expected - seen: 
+                cleaned.append(ToolMessage(
+                    tool_call_id = tid, 
+                    content = "Tool call was not completed. Please try again."
+                ))
+            i = j
+        else: 
+            i += 1
+    return cleaned
 
 
 def _scope_query_to_tenant(query: str, tenant_id: str) -> str:
@@ -223,22 +254,35 @@ async def should_continue(state: AgentState) -> AgentState:
     
 tools = [db_query_tool, search, save, grep, add_entries, retrieve_documents]
 
-
 # agent = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0.0).bind_tools(tools)
-agent = ChatOpenAI(model = "deepseek-v4-flash",
-                    openai_api_base=os.getenv("OPENCODE_API_BASE"),
-                    openai_api_key=os.getenv("OPENCODE_API")).bind_tools(tools)
+# agent = ChatOpenAI(model = "deepseek-v4-flash",
+#                     openai_api_base=os.getenv("OPENCODE_API_BASE"),
+#                     openai_api_key=os.getenv("OPENCODE_API"), 
+#                     ).bind_tools(tools)
+
+def _tool_error(e: Exception) -> str:
+    logger.exception("tool failed")                 # or logger.warning
+    return f"Tool failed: {type(e).__name__}: {e}"
 
 
-async def model_call(state : AgentState) -> AgentState:
+async def model_call(state : AgentState, config : RunnableConfig) -> AgentState:
     """ calling model for answers or tool calling"""
     system_prompt = SystemMessage(content=
     """You are a helpful assistant that can answer questions and help with tasks for the internal team.
-    Your first priority is to answer in a very clean manner. If you're querying tabular data then the user would like to see in bullet points rather than making at table with ASCII."""
+    Your first priority is to answer in a very clean manner. If you're querying tabular data then the user would like to see in bullet points rather than making at table with ASCII. No astericks formatting. Clean and professional output."""
     )
+    thread_id = config['configurable'].get('thread_id', 'jf-ai-agent')
+    agent = ChatOpenAI(
+        model="deepseek-v4-flash",
+        openai_api_base=os.getenv("OPENCODE_API_BASE"),
+        openai_api_key=os.getenv("OPENCODE_API"),
+        default_headers={"x-opencode-session": thread_id},
+    ).bind_tools(tools)
+
     logger.info("model_call invoked with %d messages in context", len(state["messages"]))
     start = time.monotonic()
-    response = await agent.ainvoke([system_prompt] + state["messages"])
+    history = sanitise_tool_calls_and_previous_messages(state["messages"])
+    response = await agent.ainvoke([system_prompt] + history)
     elapsed = time.monotonic() - start
     if response.tool_calls:
         logger.info(
@@ -258,7 +302,7 @@ graph = StateGraph(AgentState)
 
 graph.add_node("model", model_call)
 graph.add_edge(START, "model")
-tool_node = ToolNode(tools = tools)
+tool_node = ToolNode(tools = tools, handle_tool_errors= _tool_error)
 graph.add_node("tools", tool_node)
 
 graph.add_conditional_edges(
