@@ -1,8 +1,10 @@
-from pydantic import BaseModel 
+from pydantic import BaseModel
 from sqlalchemy.orm import DeclarativeBase, declarative_base, foreign, mapped_column, Mapped, relationship, foreign
 from sqlalchemy import Column, Integer, String, ForeignKey, Text, DateTime, Boolean, JSON
 from pgvector.sqlalchemy import Vector
 from datetime import datetime, timezone
+from sqlalchemy import Computed
+from sqlalchemy.dialects.postgresql import TSVECTOR
 
 class ChatRequest(BaseModel):
     message : str
@@ -33,8 +35,9 @@ class Document(Base):
     doc_metadata = Column(JSON, nullable=True)     # page count, ocr engine, etc.
     page_count = Column(Integer)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-
     embeddings = relationship("DocumentEmbedding", back_populates="document", cascade="all, delete-orphan")
+    thread_id = Column(String(length=200))
+    user = Column(String(length = 200))
 
 
 class DocumentEmbedding(Base):
@@ -46,10 +49,13 @@ class DocumentEmbedding(Base):
     document_id = Column(Integer, ForeignKey("documents.id"), nullable=False)
     chunk_index = Column(Integer)
     chunk_text = Column(Text)
+    block_type = Column(String(length=50), nullable=True)   # "table" / "formula" / "text" / None for plain-OCR chunks
+    label = Column(String(length=100), nullable=True)       # raw layout-detection label, e.g. "table_title"
     embedding = Column(Vector(2048))            # dim must match your embedding model, 1024 -> 2048
+    search_vector = Column(TSVECTOR, Computed("to_tsvector('english', coalesce(chunk_text, ''))", persisted = True))
 
 
-    
+
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     document = relationship("Document", back_populates="embeddings")

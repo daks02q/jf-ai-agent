@@ -20,6 +20,7 @@ def verify_jwt_token(credentials: HTTPAuthorizationCredentials = Security(bearer
     try: 
         payload = jwt.decode(token, SECRET_KEY, algorithms = [ALGORITHM])
         username = payload.get('sub')
+        role = payload.get('role')
         session_id = payload.get('session_id')
 
         if not username:

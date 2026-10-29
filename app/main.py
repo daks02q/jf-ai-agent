@@ -16,6 +16,8 @@ from psycopg.rows import dict_row
 from api.routes import router
 from db.models import Base
 from db.engine import session_maker
+from helpers.tracing import Telemetry
+
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,10 @@ logger = logging.getLogger(__name__)
 async def lifespan(app : FastAPI):
     chkpt_url = os.getenv("CHKPT_URL")
     logger.info("Starting up: opening checkpoint pool (%s)", redact_url(chkpt_url))
-    async with AsyncConnectionPool(conninfo = chkpt_url, max_size = 20, kwargs = {"autocommit" : True, "row_factory" : dict_row}, open = False,) as pool:
+    async with AsyncConnectionPool(
+        conninfo = chkpt_url, max_size = 20, 
+        kwargs = {"autocommit" : True, "row_factory" : dict_row}, open = False, 
+        check = AsyncConnectionPool.check_connection) as pool:
         await pool.open()
         logger.info("Checkpoint pool open")
         checkpointer = AsyncPostgresSaver(pool)
@@ -36,6 +41,13 @@ async def lifespan(app : FastAPI):
 
 
 app = FastAPI(lifespan = lifespan)
+
+if os.getenv("OTEL_ENABLED", "false").lower() == "true":
+    Telemetry.initialize(
+        app,
+        service_name = os.getenv("OTEL_SERVICE_NAME", "ai_agent"),
+        dev_mode = os.getenv("OTEL_DEV", "false").lower() == "true",
+    )
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 
